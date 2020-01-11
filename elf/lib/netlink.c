@@ -8,6 +8,7 @@
 #include <sys/socket.h>
 #include <errno.h>
 #include <time.h>
+#include <linux/version.h>
 
 #include "include/bpf.h"
 #include "include/libbpf.h"
@@ -155,6 +156,7 @@ int bpf_set_link_xdp_fd(int ifindex, int fd, __u32 flags)
 	memcpy((char *)nla_xdp + NLA_HDRLEN, &fd, sizeof(fd));
 	nla->nla_len += nla_xdp->nla_len;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,0)
 	if (flags) {
   		nla_xdp = (struct nlattr *)((char *)nla + nla->nla_len);
   		nla_xdp->nla_type = IFLA_XDP_FLAGS;
@@ -162,6 +164,7 @@ int bpf_set_link_xdp_fd(int ifindex, int fd, __u32 flags)
   		memcpy((char *)nla_xdp + NLA_HDRLEN, &flags, sizeof(flags));
   		nla->nla_len += nla_xdp->nla_len;
 	}
+#endif
 
 	req.nh.nlmsg_len += NLA_ALIGN(nla->nla_len);
 

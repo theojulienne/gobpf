@@ -77,7 +77,7 @@ static void bpf_apply_relocation(int fd, struct bpf_insn *insn)
 }
 
 static int bpf_create_map(enum bpf_map_type map_type, int key_size,
-	int value_size, int max_entries, int map_flags)
+	int value_size, int max_entries, int map_flags, int inner_map_fd)
 {
 	int ret;
 	union bpf_attr attr;
@@ -88,6 +88,7 @@ static int bpf_create_map(enum bpf_map_type map_type, int key_size,
 	attr.value_size = value_size;
 	attr.max_entries = max_entries;
 	attr.map_flags = map_flags;
+	attr.inner_map_fd = inner_map_fd;
 
 	ret = syscall(__NR_bpf, BPF_MAP_CREATE, &attr, sizeof(attr));
 	if (ret < 0 && errno == EPERM) {
@@ -131,7 +132,7 @@ int get_pinned_obj_fd(const char *path)
 	return syscall(__NR_bpf, BPF_OBJ_GET, &attr, sizeof(attr));
 }
 
-static bpf_map *bpf_load_map(bpf_map_def *map_def, const char *path)
+static bpf_map *bpf_load_map(bpf_map_def *map_def, const char *path, bpf_map_def *template)
 {
 	bpf_map *map;
 	struct stat st;
@@ -162,11 +163,27 @@ static bpf_map *bpf_load_map(bpf_map_def *map_def, const char *path)
 		do_pin = 1;
 	}
 
+	int inner_map_fd = 0;
+
+	if (template != NULL) {
+		inner_map_fd = bpf_create_map(template->type,
+			template->key_size,
+			template->value_size,
+			template->max_entries,
+			template->map_flags,
+			0
+		);
+
+		// map in map, outer map has value size of 4: https://github.com/torvalds/linux/blob/386403a115f95997c2715691226e11a7b5cffcfd/tools/lib/bpf/bpf.c#L163
+		map_def->value_size = 4;
+	}
+
 	map->fd = bpf_create_map(map_def->type,
 		map_def->key_size,
 		map_def->value_size,
 		map_def->max_entries,
-		map_def->map_flags
+		map_def->map_flags,
+		inner_map_fd
 	);
 
 	if (map->fd < 0) {
@@ -394,7 +411,20 @@ func elfReadMaps(file *elf.File, params map[string]SectionParams) (map[string]*M
 		mapPathC := C.CString(mapPath)
 		defer C.free(unsafe.Pointer(mapPathC))
 
-		cm, err := C.bpf_load_map(mapDef, mapPathC)
+		var innerMapTemplate *C.bpf_map_def
+		if p, ok := params[section.Name]; ok {
+			if mapDef._type == C.BPF_MAP_TYPE_ARRAY_OF_MAPS || mapDef._type == C.BPF_MAP_TYPE_HASH_OF_MAPS {
+				innerMapTemplate = &C.bpf_map_def{
+					_type: C.uint(p.InnerMapTemplate.MapType),
+					key_size: C.uint(p.InnerMapTemplate.KeySize),
+					value_size: C.uint(p.InnerMapTemplate.ValueSize),
+					max_entries: C.uint(p.InnerMapTemplate.MaxEntries),
+					map_flags: C.uint(p.InnerMapTemplate.MapFlags),
+				}
+			}
+		}
+
+		cm, err := C.bpf_load_map(mapDef, mapPathC, innerMapTemplate)
 		if cm == nil {
 			return nil, fmt.Errorf("error while loading map %q: %v", section.Name, err)
 		}
@@ -480,11 +510,20 @@ func (b *Module) relocate(data []byte, rdata []byte) error {
 	}
 }
 
+type MapTemplate struct {
+	MapType uint
+	KeySize uintptr
+	ValueSize uintptr
+	MaxEntries uintptr
+	MapFlags uint
+}
+
 type SectionParams struct {
 	PerfRingBufferPageCount   int
 	SkipPerfMapInitialization bool
 	PinPath                   string // path to be pinned, relative to "/sys/fs/bpf"
 	MapMaxEntries             int    // Used to override bpf map entries size
+	InnerMapTemplate          MapTemplate
 }
 
 // Load loads the BPF programs and BPF maps in the module. Each ELF section
@@ -917,6 +956,43 @@ func (b *Module) Map(name string) *Map {
 
 func (m *Map) Fd() int {
 	return int(m.m.fd)
+}
+
+const (
+	BPF_MAP_TYPE_UNSPEC = C.BPF_MAP_TYPE_UNSPEC
+	BPF_MAP_TYPE_HASH = C.BPF_MAP_TYPE_HASH
+	BPF_MAP_TYPE_ARRAY = C.BPF_MAP_TYPE_ARRAY
+	BPF_MAP_TYPE_PROG_ARRAY = C.BPF_MAP_TYPE_PROG_ARRAY
+	BPF_MAP_TYPE_PERF_EVENT_ARRAY = C.BPF_MAP_TYPE_PERF_EVENT_ARRAY
+	BPF_MAP_TYPE_PERCPU_HASH = C.BPF_MAP_TYPE_PERCPU_HASH
+	BPF_MAP_TYPE_PERCPU_ARRAY = C.BPF_MAP_TYPE_PERCPU_ARRAY
+	BPF_MAP_TYPE_STACK_TRACE = C.BPF_MAP_TYPE_STACK_TRACE
+	BPF_MAP_TYPE_CGROUP_ARRAY = C.BPF_MAP_TYPE_CGROUP_ARRAY
+	BPF_MAP_TYPE_LRU_HASH = C.BPF_MAP_TYPE_LRU_HASH
+	BPF_MAP_TYPE_LRU_PERCPU_HASH = C.BPF_MAP_TYPE_LRU_PERCPU_HASH
+	BPF_MAP_TYPE_LPM_TRIE = C.BPF_MAP_TYPE_LPM_TRIE
+	BPF_MAP_TYPE_ARRAY_OF_MAPS = C.BPF_MAP_TYPE_ARRAY_OF_MAPS
+	BPF_MAP_TYPE_HASH_OF_MAPS = C.BPF_MAP_TYPE_HASH_OF_MAPS
+	BPF_MAP_TYPE_DEVMAP = C.BPF_MAP_TYPE_DEVMAP
+	BPF_MAP_TYPE_SOCKMAP = C.BPF_MAP_TYPE_SOCKMAP
+	BPF_MAP_TYPE_CPUMAP = C.BPF_MAP_TYPE_CPUMAP
+)
+
+func CreateMap(mapPath string, mapType uint, keySize uintptr, valueSize uintptr, maxEntries uintptr, mapFlags uint) (*Map, error) {
+	mapDef := &C.bpf_map_def{
+		_type: C.uint(mapType),
+		key_size: C.uint(keySize),
+		value_size: C.uint(valueSize),
+		max_entries: C.uint(maxEntries),
+		map_flags: C.uint(mapFlags),
+	}
+	mapPathC := C.CString(mapPath)
+	var innerMapTemplate *C.bpf_map_def
+	cm, err := C.bpf_load_map(mapDef, mapPathC, innerMapTemplate)
+        if cm == nil {
+                return nil, fmt.Errorf("error while creating map: %v", err)
+        }
+	return &Map{Name: mapPath, m: cm}, nil
 }
 
 // GetProgFd returns the fd for a pinned bpf program at the given path
